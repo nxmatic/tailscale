@@ -20,6 +20,9 @@ var errNotOurAddress = errors.New("not our address")
 // errAddrExists is returned if a returned address is already in the returned pool.
 var errAddrExists = errors.New("address already returned")
 
+// errUninitializedIPPool is returned if the pool is used when it's not initialized
+var errUninitializedIPPool = errors.New("uninitialized ippool")
+
 // ipSetIterator allows for round robin iteration over all the addresses within a netipx.IPSet.
 // netipx.IPSet has a Ranges call that returns the "minimum and sorted set of IP ranges that covers [the set]".
 // netipx.IPRange is "an inclusive range of IP addresses from the same address family.". So we can iterate over
@@ -78,6 +81,9 @@ type ippool struct {
 }
 
 func (ipp *ippool) next() (netip.Addr, error) {
+	if ipp == nil || ipp.ipSetIterator == nil {
+		return netip.Addr{}, errUninitializedIPPool
+	}
 	a, err := ipp.ipSetIterator.next()
 	if err != nil {
 		return netip.Addr{}, err
@@ -97,7 +103,7 @@ func (ipp *ippool) next() (netip.Addr, error) {
 }
 
 func (ipp *ippool) returnAddr(a netip.Addr) error {
-	if !ipp.ipSet.Contains(a) {
+	if !ipp.ipSet.Contains(a) && !ipp.inUse.Contains(a) {
 		return errNotOurAddress
 	}
 	if !ipp.inUse.Contains(a) {
@@ -105,4 +111,15 @@ func (ipp *ippool) returnAddr(a netip.Addr) error {
 	}
 	ipp.inUse.Delete(a)
 	return nil
+}
+
+func (ipp *ippool) reconfig(ipset *netipx.IPSet) *ippool {
+	newPool := newIPPool(ipset)
+	if ipp != nil {
+		// even if the definition of which addresses are in the pool has changed
+		// we don't want to lose track of which addresses are currently in use
+		newPool.inUse = ipp.inUse
+		return newPool
+	}
+	return newPool
 }
