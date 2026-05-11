@@ -11,6 +11,8 @@ import (
 	"testing"
 	"time"
 
+	dto "github.com/prometheus/client_model/go"
+	"github.com/prometheus/common/expfmt"
 	"tailscale.com/client/local"
 	"tailscale.com/tailcfg"
 	"tailscale.com/tstest"
@@ -908,6 +910,49 @@ func TestMullvadExitNode(t *testing.T) {
 	check(checkOff2Step, "exit-off (again)", clientWAN)
 }
 
+// checkNodeClientMetrics fetches the client metrics from the given node and
+// verifies that each of the specified metrics exists and has the given value.
+func checkNodeClientMetrics(t *testing.T, node *vmtest.Node, want map[string]float64) {
+	t.Helper()
+	data, err := node.Agent().DaemonMetrics(t.Context())
+	if err != nil {
+		t.Fatalf("fetch node %q daemon metrics: %v", node.Name(), err)
+	}
+
+	// Metrics are in Prometheus exposition format. Tailscale client metrics are all
+	// counters an gauges (and integer-valued) so we can simplify the processing a bit.
+	var parser expfmt.TextParser
+	mfs, err := parser.TextToMetricFamilies(bytes.NewReader(data))
+	if err != nil {
+		t.Fatalf("parse node %q metrics: %v", node.Name(), err)
+	}
+
+	for _, mf := range mfs {
+		name := mf.GetName()
+		wantValue, ok := want[name]
+		if !ok {
+			continue // not of interest
+		}
+		var gotValue *float64
+		for _, m := range mf.Metric {
+			if t := mf.GetType(); t == dto.MetricType_COUNTER {
+				gotValue = new(m.GetCounter().GetValue())
+				break
+			} else if t == dto.MetricType_GAUGE {
+				gotValue = new(m.GetGauge().GetValue())
+				break
+			}
+
+			// We do not expect other metric types, but skip them if they exist.
+		}
+		if gotValue == nil {
+			t.Errorf("node %q metric %q: not found", node.Name(), name)
+		} else if *gotValue != wantValue {
+			t.Errorf("node %q metric %q: got %v, want %v", node.Name(), name, *gotValue, wantValue)
+		}
+	}
+}
+
 // TestCachedNetmapAfterRestart verifies that two nodes with netmap
 // caching enabled (NodeAttrCacheNetworkMaps) can re-establish a direct
 // WireGuard tunnel after both are restarted while the control server is
@@ -1002,6 +1047,12 @@ func TestDirectConnectionWithCachedNetmapOnOneNode(t *testing.T) {
 
 	env.Start()
 
+	// Before: Verify that we have not recorded any cached contacts.
+	checkNodeClientMetrics(t, a, map[string]float64{
+		"magicsock_cached_peer_contact_derp":   0,
+		"magicsock_cached_peer_contact_direct": 0,
+	})
+
 	cutControlStep.Begin()
 	a.DropControlTraffic()
 	env.ControlServer().SetOnMapRequest(func(nk key.NodePublic) {
@@ -1028,4 +1079,9 @@ func TestDirectConnectionWithCachedNetmapOnOneNode(t *testing.T) {
 		t.Fatal(err)
 	}
 	DiscoPingStep.End(nil)
+
+	// After: Verify that we recorded a direct contact on the disconnected node.
+	checkNodeClientMetrics(t, a, map[string]float64{
+		"magicsock_cached_peer_contact_direct": 1,
+	})
 }
