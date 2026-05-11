@@ -317,8 +317,6 @@ func (esr *egressSvcsReconciler) provision(ctx context.Context, proxyGroupName s
 	}
 
 	crl := egressSvcEpsLabels(svc, clusterIPSvc)
-	// TODO(irbekrm): support IPv6, but need to investigate how kube proxy
-	// sets up Service -> Pod routing when IPv6 is involved.
 	eps := &discoveryv1.EndpointSlice{
 		ObjectMeta: metav1.ObjectMeta{
 			Name:      fmt.Sprintf("%s-ipv4", clusterIPSvc.Name),
@@ -336,7 +334,26 @@ func (esr *egressSvcsReconciler) provision(ctx context.Context, proxyGroupName s
 			p.Conditions.Ready = nil
 		}
 	}); err != nil {
-		return nil, false, fmt.Errorf("error ensuring EndpointSlice: %w", err)
+		return nil, false, fmt.Errorf("error ensuring IPv4 EndpointSlice: %w", err)
+	}
+	epsv6 := &discoveryv1.EndpointSlice{
+		ObjectMeta: metav1.ObjectMeta{
+			Name:      fmt.Sprintf("%s-ipv6", clusterIPSvc.Name),
+			Namespace: esr.tsNamespace,
+			Labels:    crl,
+		},
+		AddressType: discoveryv1.AddressTypeIPv6,
+		Ports:       epsPortsFromSvc(clusterIPSvc),
+	}
+	if epsv6, err = createOrUpdate(ctx, esr.Client, esr.tsNamespace, epsv6, func(e *discoveryv1.EndpointSlice) {
+		e.Labels = epsv6.Labels
+		e.AddressType = epsv6.AddressType
+		e.Ports = epsv6.Ports
+		for _, p := range e.Endpoints {
+			p.Conditions.Ready = nil
+		}
+	}); err != nil {
+		return nil, false, fmt.Errorf("error ensuring IPv6 EndpointSlice: %w", err)
 	}
 
 	cm, cfgs, err := egressSvcsConfigs(ctx, esr.Client, proxyGroupName, esr.tsNamespace)
