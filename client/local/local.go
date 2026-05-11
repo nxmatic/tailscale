@@ -327,6 +327,21 @@ func (lc *Client) WhoIs(ctx context.Context, remoteAddr string) (*apitype.WhoIsR
 	return decodeJSON[*apitype.WhoIsResponse](body)
 }
 
+// WhoIsForService is like [Client.WhoIs] but scopes the returned CapMap to
+// capabilities that apply to the given VIP service address. svcAddr is the
+// VIP IP that the peer's connection landed on. This enables per-service
+// capability resolution on hosts that advertise multiple VIP services.
+func (lc *Client) WhoIsForService(ctx context.Context, remoteAddr string, svcAddr netip.Addr) (*apitype.WhoIsResponse, error) {
+	body, err := lc.get200(ctx, "/localapi/v0/whois?addr="+url.QueryEscape(remoteAddr)+"&svc_addr="+url.QueryEscape(svcAddr.String()))
+	if err != nil {
+		if hs, ok := err.(httpStatusError); ok && hs.HTTPStatus == http.StatusNotFound {
+			return nil, ErrPeerNotFound
+		}
+		return nil, err
+	}
+	return decodeJSON[*apitype.WhoIsResponse](body)
+}
+
 // ErrPeerNotFound is returned by [Client.WhoIs], [Client.WhoIsNodeKey] and
 // [Client.WhoIsProto] when a peer is not found.
 var ErrPeerNotFound = errors.New("peer not found")

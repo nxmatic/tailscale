@@ -545,6 +545,7 @@ type localBackendWhoIsMethods interface {
 	WhoIs(string, netip.AddrPort) (n tailcfg.NodeView, u tailcfg.UserProfile, ok bool)
 	WhoIsNodeKey(key.NodePublic) (n tailcfg.NodeView, u tailcfg.UserProfile, ok bool)
 	PeerCaps(netip.Addr) tailcfg.PeerCapMap
+	PeerCapsForService(src, svcAddr netip.Addr) tailcfg.PeerCapMap
 }
 
 func (h *Handler) serveWhoIsWithBackend(w http.ResponseWriter, r *http.Request, b localBackendWhoIsMethods) {
@@ -591,7 +592,9 @@ func (h *Handler) serveWhoIsWithBackend(w http.ResponseWriter, r *http.Request, 
 		Node:        n.AsStruct(), // always non-nil per WhoIsResponse contract
 		UserProfile: &u,           // always non-nil per WhoIsResponse contract
 	}
-	if n.Addresses().Len() > 0 {
+	if svcAddr, err := netip.ParseAddr(r.FormValue("svc_addr")); err == nil {
+		res.CapMap = b.PeerCapsForService(n.Addresses().At(0).Addr(), svcAddr)
+	} else if n.Addresses().Len() > 0 {
 		res.CapMap = b.PeerCaps(n.Addresses().At(0).Addr())
 	}
 	j, err := json.MarshalIndent(res, "", "\t")
