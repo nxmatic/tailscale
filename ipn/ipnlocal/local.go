@@ -7517,7 +7517,7 @@ func (b *LocalBackend) setTCPPortsInterceptedFromNetmapAndPrefsLocked(prefs ipn.
 	handlePorts := make([]uint16, 0, 4)
 
 	if prefs.Valid() && prefs.RunSSH() && envknob.CanSSHD() {
-		handlePorts = append(handlePorts, 22)
+		handlePorts = append(handlePorts, 2222)
 	}
 	if b.ShouldExposeRemoteWebClient() {
 		handlePorts = append(handlePorts, webClientPort)

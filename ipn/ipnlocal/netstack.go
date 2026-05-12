@@ -44,7 +44,7 @@ func (b *LocalBackend) TCPHandlerForDst(src, dst netip.AddrPort) (handler func(c
 	if !b.isLocalIP(dst.Addr()) {
 		return nil, nil
 	}
-	if dst.Port() == 22 && b.ShouldRunSSH() {
+	if dst.Port() == 2222 && b.ShouldRunSSH() {
 		// Use a higher keepalive idle time for SSH connections, as they are
 		// typically long lived and idle connections are more likely to be
 		// intentional. Ideally we would turn this off entirely, but we can't
