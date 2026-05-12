@@ -1,0 +1,20 @@
+services:
+  headscale:
+    image: headscale/headscale:latest
+    container_name: ts-headscale-lab
+    command: serve
+    restart: unless-stopped
+    volumes:
+      - ./config/headscale.yaml:/etc/headscale/config.yaml:ro
+      - ./config/acl.hujson:/etc/headscale/acl.hujson:ro
+      - ./state/headscale:/var/lib/headscale
+    ports:
+      - "18080:8080"
+      - "19090:9090"
+      - "15443:50443"
+    healthcheck:
+      test: ["CMD", "headscale", "-c", "/etc/headscale/config.yaml", "users", "list"]
+      interval: 5s
+      timeout: 5s
+      retries: 20
+      start_period: 5s
