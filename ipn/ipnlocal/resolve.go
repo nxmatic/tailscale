@@ -58,16 +58,43 @@ func (b *LocalBackend) peerAllowedIPs(k key.NodePublic) (_ []netip.Prefix, ok bo
 // as the [tsdial.Dialer.SetResolveMagicDNS] callback.
 func (b *LocalBackend) resolveMagicDNS(hostname, network string) (_ netip.Addr, ok bool) {
 	nb := b.currentNode()
+	if ip, ok := b.resolveMagicDNSDirect(nb, hostname, network); ok {
+		return ip, true
+	}
+	// Not a node or A/AAAA ExtraRecord directly: chase any CNAME alias
+	// chain (DNS.ExtraRecords Type=CNAME) to a name that does resolve,
+	// so Tailscale's own dialers honor the aliases the quad-100
+	// resolver already serves. Depth-limited and cycle-safe, matching
+	// the resolver's maxCNAMEHops behavior.
+	const maxCNAMEHops = 8
+	cur := hostname
+	visited := map[string]bool{cur: true}
+	for hop := 0; hop < maxCNAMEHops; hop++ {
+		target, ok := nb.ExtraCNAMEByName(cur)
+		if !ok || visited[target] {
+			break
+		}
+		visited[target] = true
+		if ip, ok := b.resolveMagicDNSDirect(nb, target, network); ok {
+			return ip, true
+		}
+		cur = target
+	}
+	return netip.Addr{}, false
+}
+
+// resolveMagicDNSDirect resolves hostname to an address via the current
+// node's live indexes and ExtraRecords A/AAAA entries, without chasing
+// CNAME aliases. It takes the nodeBackend snapshot so a CNAME chase in
+// resolveMagicDNS stays consistent across hops.
+func (b *LocalBackend) resolveMagicDNSDirect(nb *nodeBackend, hostname, network string) (_ netip.Addr, ok bool) {
 	if nid, ok := nb.NodeByName(hostname); ok {
 		n, ok := nb.NodeByID(nid)
 		if !ok {
 			b.logf("[unexpected] resolveMagicDNS: NodeByName(%q) returned node %v but NodeByID failed", hostname, nid)
 			return netip.Addr{}, false
 		}
-		if ip, ok := nodeAddrForNetwork(n, network); ok {
-			return ip, true
-		}
-		return netip.Addr{}, false
+		return nodeAddrForNetwork(n, network)
 	}
 	if ip, ok := nb.ExtraDNSByName(hostname); ok && addrFamilyMatch(ip, network) {
 		return ip, true

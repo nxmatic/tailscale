@@ -53,6 +53,12 @@ type Config struct {
 	// it to resolve, you also need to add appropriate routes to
 	// Routes.
 	Hosts map[dnsname.FQDN][]netip.Addr
+	// HostCNAMEs maps a DNS FQDN to a single CNAME target FQDN.
+	// Populated from [tailcfg.DNSConfig.ExtraRecords] entries with
+	// Type=CNAME. The resolver chases CNAME chains in the local map
+	// (cycle-safe, depth-limited) and emits the canonical-name records
+	// in answers alongside the final A/AAAA.
+	HostCNAMEs map[dnsname.FQDN]dnsname.FQDN
 	// SubdomainHosts is a set of FQDNs from Hosts that should also
 	// resolve subdomain queries to the same IPs. For example, if
 	// "node.tailnet.ts.net" is in SubdomainHosts, then queries for
