@@ -414,7 +414,7 @@ func TestResolveLocal(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			ip, code := r.resolveLocal(tt.qname, tt.qtype)
+			_, ip, code := r.resolveLocal(tt.qname, tt.qtype)
 			if code != tt.code {
 				t.Errorf("code = %v; want %v", code, tt.code)
 			}
@@ -465,7 +465,7 @@ func TestResolveLocalSubdomain(t *testing.T) {
 
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			ip, code := r.resolveLocal(tt.qname, tt.qtype)
+			_, ip, code := r.resolveLocal(tt.qname, tt.qtype)
 			if code != tt.code {
 				t.Errorf("code = %v; want %v", code, tt.code)
 			}
@@ -548,7 +548,7 @@ func TestResolveLocalMagicDNSHosts(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			ip, code := r.resolveLocal(tt.qname, tt.qtype)
+			_, ip, code := r.resolveLocal(tt.qname, tt.qtype)
 			if code != tt.code {
 				t.Errorf("code = %v; want %v", code, tt.code)
 			}
@@ -576,6 +576,81 @@ func TestResolveLocalMagicDNSHosts(t *testing.T) {
 			}
 			if name != tt.want {
 				t.Errorf("name = %v; want %v", name, tt.want)
+			}
+		})
+	}
+}
+
+// TestResolveLocalCNAME exercises the CNAME-chase path added by the
+// extra-records-CNAME patch. Covers: single-hop chase, multi-hop
+// chase, CNAME-of-CNAME-of-A; depth-limit and cycle handling.
+func TestResolveLocalCNAME(t *testing.T) {
+	r := newResolver(t)
+	defer r.Close()
+
+	cfg := Config{
+		Hosts: map[dnsname.FQDN][]netip.Addr{
+			"a.example.": {testipv4},
+		},
+		HostCNAMEs: map[dnsname.FQDN]dnsname.FQDN{
+			"single.example.": "a.example.",          // 1 hop → A
+			"hop1.example.":   "hop2.example.",       // chain → A
+			"hop2.example.":   "a.example.",          //
+			"loopA.example.":  "loopB.example.",      // 2-cycle
+			"loopB.example.":  "loopA.example.",      //
+			// 8-hop chain that terminates without an A record. Each
+			// intermediate is a CNAME with no Hosts entry, so the
+			// chase exhausts maxCNAMEHops and SERVFAILs.
+			"deep1.example.": "deep2.example.",
+			"deep2.example.": "deep3.example.",
+			"deep3.example.": "deep4.example.",
+			"deep4.example.": "deep5.example.",
+			"deep5.example.": "deep6.example.",
+			"deep6.example.": "deep7.example.",
+			"deep7.example.": "deep8.example.",
+			"deep8.example.": "deep9.example.",
+			"deep9.example.": "deep10.example.",
+		},
+		LocalDomains: []dnsname.FQDN{"example."},
+	}
+	r.SetConfig(cfg)
+
+	tests := []struct {
+		name      string
+		qname     dnsname.FQDN
+		qtype     dns.Type
+		wantChain []dnsname.FQDN
+		wantIP    netip.Addr
+		wantCode  dns.RCode
+	}{
+		{"single-hop", "single.example.", dns.TypeA,
+			[]dnsname.FQDN{"a.example."}, testipv4, dns.RCodeSuccess},
+		{"two-hops", "hop1.example.", dns.TypeA,
+			[]dnsname.FQDN{"hop2.example.", "a.example."}, testipv4, dns.RCodeSuccess},
+		{"cycle-servfail", "loopA.example.", dns.TypeA,
+			nil, netip.Addr{}, dns.RCodeServerFailure},
+		{"depth-exceeded-servfail", "deep1.example.", dns.TypeA,
+			nil, netip.Addr{}, dns.RCodeServerFailure},
+		{"direct-A-no-chain", "a.example.", dns.TypeA,
+			nil, testipv4, dns.RCodeSuccess},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			chain, ip, code := r.resolveLocal(tt.qname, tt.qtype)
+			if code != tt.wantCode {
+				t.Errorf("code = %v; want %v", code, tt.wantCode)
+			}
+			if ip != tt.wantIP {
+				t.Errorf("ip = %v; want %v", ip, tt.wantIP)
+			}
+			if len(chain) != len(tt.wantChain) {
+				t.Errorf("chain len = %d (%v); want %d (%v)", len(chain), chain, len(tt.wantChain), tt.wantChain)
+				return
+			}
+			for i, got := range chain {
+				if got != tt.wantChain[i] {
+						t.Errorf("chain[%d] = %q; want %q", i, got, tt.wantChain[i])
+				}
 			}
 		})
 	}

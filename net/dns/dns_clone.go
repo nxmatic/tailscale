@@ -6,6 +6,7 @@
 package dns
 
 import (
+	"maps"
 	"net/netip"
 
 	"tailscale.com/types/dnstype"
@@ -55,6 +56,7 @@ func (src *Config) Clone() *Config {
 			dst.Hosts[k] = append([]netip.Addr{}, src.Hosts[k]...)
 		}
 	}
+	dst.HostCNAMEs = maps.Clone(src.HostCNAMEs)
 	dst.SubdomainHosts = src.SubdomainHosts.Clone()
 	return dst
 }
@@ -66,6 +68,7 @@ var _ConfigCloneNeedsRegeneration = Config(struct {
 	Routes                map[dnsname.FQDN][]*dnstype.Resolver
 	SearchDomains         []dnsname.FQDN
 	Hosts                 map[dnsname.FQDN][]netip.Addr
+	HostCNAMEs            map[dnsname.FQDN]dnsname.FQDN
 	SubdomainHosts        set.Set[dnsname.FQDN]
 	OnlyIPv6              bool
 	MagicDNSHostsUnrouted bool

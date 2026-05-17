@@ -98,6 +98,11 @@ type Config struct {
 	Routes map[dnsname.FQDN][]*dnstype.Resolver
 	// LocalHosts is a map of FQDNs to corresponding IPs.
 	Hosts map[dnsname.FQDN][]netip.Addr
+	// HostCNAMEs maps a DNS FQDN to a single CNAME target FQDN.
+	// resolveLocal chases CNAME chains found here (cycle-safe,
+	// depth-limited) and emits the canonical-name records in the
+	// answer alongside the final A/AAAA from Hosts.
+	HostCNAMEs map[dnsname.FQDN]dnsname.FQDN
 	// LocalDomains is a list of DNS name suffixes that should not be
 	// routed to upstream resolvers.
 	LocalDomains []dnsname.FQDN
@@ -245,6 +250,7 @@ type Resolver struct {
 	mu             syncs.Mutex
 	localDomains   []dnsname.FQDN
 	hostToIP       map[dnsname.FQDN][]netip.Addr
+	hostCNAMEs     map[dnsname.FQDN]dnsname.FQDN
 	ipToHost       map[netip.Addr]dnsname.FQDN
 	subdomainHosts set.Set[dnsname.FQDN]
 	magicHosts     MagicDNSHosts // or nil if none installed
@@ -363,6 +369,7 @@ func (r *Resolver) SetConfig(cfg Config) error {
 	defer r.mu.Unlock()
 	r.localDomains = cfg.LocalDomains
 	r.hostToIP = cfg.Hosts
+	r.hostCNAMEs = cfg.HostCNAMEs
 	r.ipToHost = reverse
 	r.subdomainHosts = cfg.SubdomainHosts
 	return nil
@@ -714,17 +721,27 @@ func stubResolverForOS() (ip netip.Addr, err error) {
 	return ip, nil
 }
 
+// maxCNAMEHops bounds CNAME-chain traversal in the local map. RFC
+// 1034 doesn't mandate a number; bind defaults to 16. We pick 8 as a
+// pragmatic ceiling that's deep enough for any reasonable
+// service-prefix configuration while bounding the worst case for
+// pathological data pushed by the control plane.
+const maxCNAMEHops = 8
+
 // resolveLocal returns an IP for the given domain, if domain is in
 // the local hosts map and has an IP corresponding to the requested
-// typ (A, AAAA, ALL).
+// typ (A, AAAA, ALL). When the lookup traverses one or more CNAMEs
+// in HostCNAMEs, the chain (in order, ending at the name whose Hosts
+// entry produced the returned IP) is also returned so the caller can
+// emit canonical-name RRs in the answer.
 // Returns dns.RCodeRefused to indicate that the local map is not
 // authoritative for domain.
-func (r *Resolver) resolveLocal(domain dnsname.FQDN, typ dns.Type) (netip.Addr, dns.RCode) {
+func (r *Resolver) resolveLocal(domain dnsname.FQDN, typ dns.Type) ([]dnsname.FQDN, netip.Addr, dns.RCode) {
 	metricDNSResolveLocal.Add(1)
 	// Reject .onion domains per RFC 7686.
 	if dnsname.HasSuffix(domain.WithoutTrailingDot(), ".onion") {
 		metricDNSResolveLocalErrorOnion.Add(1)
-		return netip.Addr{}, dns.RCodeNameError
+		return nil, netip.Addr{}, dns.RCodeNameError
 	}
 
 	// We return a symbolic domain if someone does a reverse lookup on the
@@ -733,36 +750,97 @@ func (r *Resolver) resolveLocal(domain dnsname.FQDN, typ dns.Type) (netip.Addr, 
 	if domain == dnsSymbolicFQDN {
 		switch typ {
 		case dns.TypeA:
-			return tsaddr.TailscaleServiceIP(), dns.RCodeSuccess
+			return nil, tsaddr.TailscaleServiceIP(), dns.RCodeSuccess
 		case dns.TypeAAAA:
-			return tsaddr.TailscaleServiceIPv6(), dns.RCodeSuccess
+			return nil, tsaddr.TailscaleServiceIPv6(), dns.RCodeSuccess
 		}
 	}
 	// Special-case: 4via6 DNS names.
 	if ip, ok := r.resolveViaDomain(domain, typ); ok {
-		return ip, dns.RCodeSuccess
+		return nil, ip, dns.RCodeSuccess
 	}
 
 	r.mu.Lock()
 	hosts := r.hostToIP
+	cnames := r.hostCNAMEs
 	localDomains := r.localDomains
 	subdomainHosts := r.subdomainHosts
 	magicHosts := r.magicHosts
 	r.mu.Unlock()
 
-	addrs, found := hosts[domain]
-	if !found && magicHosts != nil {
-		addrs, found = magicHosts.LookupHost(domain)
+	// CNAME-only queries: answer from the local cname map, no chase.
+	// The marshaler path for TypeCNAME consumes resp.CNAME (not
+	// CNAMEChain), so we route through the existing field via the
+	// caller — return a sentinel via the chain so the caller can map
+	// it onto resp.CNAME. We keep TypeCNAME behavior conservative:
+	// only answer if the queried name is itself a CNAME source.
+	if typ == dns.TypeCNAME {
+		if target, ok := cnames[domain]; ok {
+			// Single hop: chain = [target], ip zero, success.
+			return []dnsname.FQDN{target}, netip.Addr{}, dns.RCodeSuccess
+		}
 	}
-	if !found {
-		for parent := domain.Parent(); parent != ""; parent = parent.Parent() {
-			if subdomainHosts.Contains(parent) {
-				addrs, found = hosts[parent]
+
+	// Chase a CNAME chain. cur tracks the current name being looked
+	// up; chain accumulates each canonical target encountered, in
+	// order. Cycle detection uses a small visited-set scoped to this
+	// call. At each hop we stop as soon as cur resolves to an address
+	// via either the static Hosts map or the on-demand MagicDNSHosts
+	// hook (v1.102 moved MagicDNS host records out of Hosts).
+	cur := domain
+	var chain []dnsname.FQDN
+	visited := map[dnsname.FQDN]bool{cur: true}
+	for hop := 0; hop < maxCNAMEHops; hop++ {
+		if _, ok := hosts[cur]; ok {
+			break
+		}
+		if magicHosts != nil {
+			if _, ok := magicHosts.LookupHost(cur); ok {
 				break
 			}
-			if magicHosts != nil && magicHosts.SubdomainHost(parent) {
-				addrs, found = magicHosts.LookupHost(parent)
-				break
+		}
+		target, ok := cnames[cur]
+		if !ok {
+			break
+		}
+		if visited[target] {
+			// Cycle in CNAME data. Treat as server failure rather
+			// than NXDOMAIN — the data we received from the control
+			// plane is corrupt; advertising NXDOMAIN would mask it.
+			metricDNSResolveLocalErrorMissing.Add(1)
+			return nil, netip.Addr{}, dns.RCodeServerFailure
+		}
+		visited[target] = true
+		chain = append(chain, target)
+		cur = target
+	}
+	if len(chain) == maxCNAMEHops {
+		// Exceeded depth limit without landing on an A/AAAA-bearing
+		// name. Same SERVFAIL treatment as a cycle.
+		metricDNSResolveLocalErrorMissing.Add(1)
+		return nil, netip.Addr{}, dns.RCodeServerFailure
+	}
+
+	addrs, found := hosts[cur]
+	if !found && magicHosts != nil {
+		addrs, found = magicHosts.LookupHost(cur)
+	}
+	if !found {
+		// SubdomainHosts wildcard is consulted only on the *original*
+		// query name (not on intermediate CNAME targets) — its
+		// semantics are "every subdomain of this entry resolves to
+		// the entry's IPs", and chasing a CNAME into a SubdomainHosts
+		// shadow would make name choice ambiguous.
+		if len(chain) == 0 {
+			for parent := domain.Parent(); parent != ""; parent = parent.Parent() {
+				if subdomainHosts.Contains(parent) {
+					addrs, found = hosts[parent]
+					break
+				}
+				if magicHosts != nil && magicHosts.SubdomainHost(parent) {
+					addrs, found = magicHosts.LookupHost(parent)
+					break
+				}
 			}
 		}
 	}
@@ -771,12 +849,12 @@ func (r *Resolver) resolveLocal(domain dnsname.FQDN, typ dns.Type) (netip.Addr, 
 			if suffix.Contains(domain) {
 				// We are authoritative for the queried domain.
 				metricDNSResolveLocalErrorMissing.Add(1)
-				return netip.Addr{}, dns.RCodeNameError
+				return chain, netip.Addr{}, dns.RCodeNameError
 			}
 		}
 		// Not authoritative, signal that forwarding is advisable.
 		metricDNSResolveLocalErrorRefused.Add(1)
-		return netip.Addr{}, dns.RCodeRefused
+		return nil, netip.Addr{}, dns.RCodeRefused
 	}
 
 	// Refactoring note: this must happen after we check suffixes,
@@ -790,37 +868,37 @@ func (r *Resolver) resolveLocal(domain dnsname.FQDN, typ dns.Type) (netip.Addr, 
 		for _, ip := range addrs {
 			if ip.Is4() {
 				metricDNSResolveLocalOKA.Add(1)
-				return ip, dns.RCodeSuccess
+				return chain, ip, dns.RCodeSuccess
 			}
 		}
 		metricDNSResolveLocalNoA.Add(1)
-		return netip.Addr{}, dns.RCodeSuccess
+		return chain, netip.Addr{}, dns.RCodeSuccess
 	case dns.TypeAAAA:
 		for _, ip := range addrs {
 			if ip.Is6() {
 				metricDNSResolveLocalOKAAAA.Add(1)
-				return ip, dns.RCodeSuccess
+				return chain, ip, dns.RCodeSuccess
 			}
 		}
 		metricDNSResolveLocalNoAAAA.Add(1)
-		return netip.Addr{}, dns.RCodeSuccess
+		return chain, netip.Addr{}, dns.RCodeSuccess
 	case dns.TypeALL:
 		// Answer with whatever we've got.
 		// It could be IPv4, IPv6, or a zero addr.
 		// TODO: Return all available resolutions (A and AAAA, if we have them).
 		if len(addrs) == 0 {
 			metricDNSResolveLocalNoAll.Add(1)
-			return netip.Addr{}, dns.RCodeSuccess
+			return chain, netip.Addr{}, dns.RCodeSuccess
 		}
 		metricDNSResolveLocalOKAll.Add(1)
-		return addrs[0], dns.RCodeSuccess
+		return chain, addrs[0], dns.RCodeSuccess
 
 	// Leave some record types explicitly unimplemented.
 	// These types relate to recursive resolution or special
 	// DNS semantics and might be implemented in the future.
 	case dns.TypeNS, dns.TypeSOA, dns.TypeAXFR, dns.TypeHINFO:
 		metricDNSResolveNotImplType.Add(1)
-		return netip.Addr{}, dns.RCodeNotImplemented
+		return nil, netip.Addr{}, dns.RCodeNotImplemented
 
 	// For everything except for the few types above that are explicitly not implemented, return no records.
 	// This is what other DNS systems do: always return NOERROR
@@ -831,7 +909,7 @@ func (r *Resolver) resolveLocal(domain dnsname.FQDN, typ dns.Type) (netip.Addr, 
 	default:
 		metricDNSResolveNoRecordType.Add(1)
 		// The name exists, but no records exist of the requested type.
-		return netip.Addr{}, dns.RCodeSuccess
+		return chain, netip.Addr{}, dns.RCodeSuccess
 	}
 }
 
@@ -965,6 +1043,12 @@ type response struct {
 	// Either/both/neither can be populated.
 	IP  netip.Addr
 	IPs []netip.Addr
+
+	// CNAMEChain holds the ordered list of canonical-name FQDNs
+	// traversed before resolving to IP/IPs. Empty when the question's
+	// name resolved directly. Marshalled into the answer section as
+	// CNAME RRs prefixing the final A/AAAA on A/AAAA queries.
+	CNAMEChain []dnsname.FQDN
 
 	// TXT is the response to a TXT query.
 	// Each one is its own RR with one string.
@@ -1248,11 +1332,28 @@ func marshalResponse(resp *response) ([]byte, error) {
 
 	switch resp.Question.Type {
 	case dns.TypeA, dns.TypeAAAA, dns.TypeALL:
-		if err := marshalIP(resp.Question.Name, resp.IP, &builder); err != nil {
+		// Emit a CNAME RR per chain hop, with each hop's owner being
+		// the previous step's name. The final A/AAAA's owner is the
+		// last name in the chain (the canonical name); when no CNAMEs
+		// are involved the owner stays at Question.Name.
+		ipOwner := resp.Question.Name
+		owner := resp.Question.Name
+		for _, target := range resp.CNAMEChain {
+			if err := marshalCNAME(owner, target.WithTrailingDot(), &builder); err != nil {
+				return nil, err
+			}
+			next, err := dns.NewName(target.WithTrailingDot())
+			if err != nil {
+				return nil, err
+			}
+			owner = next
+			ipOwner = next
+		}
+		if err := marshalIP(ipOwner, resp.IP, &builder); err != nil {
 			return nil, err
 		}
 		for _, ip := range resp.IPs {
-			if err := marshalIP(resp.Question.Name, ip, &builder); err != nil {
+			if err := marshalIP(ipOwner, ip, &builder); err != nil {
 				return nil, err
 			}
 		}
@@ -1472,7 +1573,7 @@ func (r *Resolver) respond(query []byte) ([]byte, error) {
 		return r.respondReverse(query, name, parser.response())
 	}
 
-	ip, rcode := r.resolveLocal(name, parser.Question.Type)
+	chain, ip, rcode := r.resolveLocal(name, parser.Question.Type)
 	if rcode == dns.RCodeRefused {
 		return nil, errNotOurName // sentinel error return value: it requests forwarding
 	}
@@ -1490,6 +1591,15 @@ func (r *Resolver) respond(query []byte) ([]byte, error) {
 			// type (e.g. an AAAA query for an IPv4-only node).
 			resp.SOAZone = r.authoritativeZoneFor(name)
 		}
+	}
+	resp.CNAMEChain = chain
+	// For a TypeCNAME query that hit a local CNAME entry,
+	// resolveLocal stuffs the single-hop target into chain[0]; the
+	// existing TypeCNAME marshaler reads resp.CNAME, so route the
+	// value across.
+	if parser.Question.Type == dns.TypeCNAME && len(chain) > 0 {
+		resp.CNAME = chain[0].WithTrailingDot()
+		resp.CNAMEChain = nil
 	}
 	metricDNSMagicDNSSuccessName.Add(1)
 	return marshalResponse(resp)

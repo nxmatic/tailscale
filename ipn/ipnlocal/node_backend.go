@@ -1505,23 +1505,35 @@ func dnsConfigForNetmap(nm *netmap.NetworkMap, peers map[tailcfg.NodeID]tailcfg.
 		}
 	}
 	for _, rec := range nm.DNS.ExtraRecords {
-		switch rec.Type {
-		case "", "A", "AAAA":
-			// Treat these all the same for now: infer from the value
-		default:
-			// TODO: more
-			continue
-		}
-		ip, err := netip.ParseAddr(rec.Value)
-		if err != nil {
-			// Ignore.
-			continue
-		}
 		fqdn, err := dnsname.ToFQDN(rec.Name)
 		if err != nil {
 			continue
 		}
-		dcfg.Hosts[fqdn] = append(dcfg.Hosts[fqdn], ip)
+		switch rec.Type {
+		case "", "A", "AAAA":
+			ip, err := netip.ParseAddr(rec.Value)
+			if err != nil {
+				continue
+			}
+			dcfg.Hosts[fqdn] = append(dcfg.Hosts[fqdn], ip)
+		case "CNAME":
+			target, err := dnsname.ToFQDN(rec.Value)
+			if err != nil {
+				continue
+			}
+			if dcfg.HostCNAMEs == nil {
+				dcfg.HostCNAMEs = map[dnsname.FQDN]dnsname.FQDN{}
+			}
+			// Last write wins for duplicates; consistent with how Hosts
+			// would behave for duplicate IPs (which append) — CNAMEs
+			// don't append because a name can only have one canonical
+			// target per RFC 1034 §3.6.2.
+			dcfg.HostCNAMEs[fqdn] = target
+		default:
+			// Other record types remain unsupported; the wire spec at
+			// [tailcfg.DNSRecord] documents this.
+			continue
+		}
 	}
 
 	if !prefs.CorpDNS() {
