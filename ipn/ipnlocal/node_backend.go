@@ -150,6 +150,13 @@ type nodeBackend struct {
 	// hostname (lowercase, no trailing dot).
 	extraDNS map[string]netip.Addr
 
+	// extraCNAME stores DNS.ExtraRecords Type=CNAME entries from the
+	// netmap, mapping a canonicalized source hostname to its canonical
+	// target (both lowercase, no trailing dot). It lets Tailscale's own
+	// dialers (e.g. `tailscale ssh`) chase CNAME aliases the same way
+	// the quad-100 resolver does; see resolveMagicDNS.
+	extraCNAME map[string]string
+
 	// userProfiles is the live set of user profiles, updated incrementally
 	// by mergeUserProfiles as deltas arrive. It parallels the peers map:
 	// netMap.UserProfiles is the frozen snapshot from the last full install,
@@ -807,6 +814,7 @@ func (nb *nodeBackend) updateNodeByNameLocked() {
 	if nm == nil {
 		nb.nodeByName = nil
 		nb.extraDNS = nil
+		nb.extraCNAME = nil
 		return
 	}
 
@@ -819,17 +827,23 @@ func (nb *nodeBackend) updateNodeByNameLocked() {
 		}
 	})
 
-	// Rebuild extraDNS from DNS.ExtraRecords (service VIPs, etc).
+	// Rebuild extraDNS/extraCNAME from DNS.ExtraRecords (service VIPs,
+	// CNAME aliases, etc).
 	nb.extraDNS = nil
+	nb.extraCNAME = nil
 	for _, rec := range nm.DNS.ExtraRecords {
-		if rec.Type != "" {
-			continue
+		switch rec.Type {
+		case "":
+			ip, err := netip.ParseAddr(rec.Value)
+			if err != nil {
+				continue
+			}
+			mak.Set(&nb.extraDNS, strings.ToLower(strings.TrimSuffix(rec.Name, ".")), ip)
+		case "CNAME":
+			mak.Set(&nb.extraCNAME,
+				strings.ToLower(strings.TrimSuffix(rec.Name, ".")),
+				strings.ToLower(strings.TrimSuffix(rec.Value, ".")))
 		}
-		ip, err := netip.ParseAddr(rec.Value)
-		if err != nil {
-			continue
-		}
-		mak.Set(&nb.extraDNS, strings.ToLower(strings.TrimSuffix(rec.Name, ".")), ip)
 	}
 }
 
@@ -849,6 +863,16 @@ func (nb *nodeBackend) ExtraDNSByName(hostname string) (_ netip.Addr, ok bool) {
 	defer nb.mu.Unlock()
 	ip, ok := nb.extraDNS[hostname]
 	return ip, ok
+}
+
+// ExtraCNAMEByName returns the canonical target for a DNS.ExtraRecords
+// Type=CNAME entry, if the hostname is a CNAME source. The input and
+// result are canonicalized (lowercase, no trailing dot).
+func (nb *nodeBackend) ExtraCNAMEByName(hostname string) (_ string, ok bool) {
+	nb.mu.Lock()
+	defer nb.mu.Unlock()
+	target, ok := nb.extraCNAME[hostname]
+	return target, ok
 }
 
 func (nb *nodeBackend) updatePeersLocked() (discoChanged []key.NodePublic, routeChanged routemanager.PeersWithRouteChanges) {
@@ -1498,26 +1522,41 @@ func dnsConfigForNetmap(nm *netmap.NetworkMap, peers map[tailcfg.NodeID]tailcfg.
 	// dcfg.Hosts because on Windows that map also holds every node's records.
 	var extraRecordNames []dnsname.FQDN
 	for _, rec := range nm.DNS.ExtraRecords {
-		switch rec.Type {
-		case "", "A", "AAAA":
-			// Treat these all the same for now: infer from the value
-		default:
-			// TODO: more
-			continue
-		}
-		ip, err := netip.ParseAddr(rec.Value)
-		if err != nil {
-			// Ignore.
-			continue
-		}
 		fqdn, err := dnsname.ToFQDN(rec.Name)
 		if err != nil {
 			continue
 		}
-		if !slices.Contains(extraRecordNames, fqdn) {
-			extraRecordNames = append(extraRecordNames, fqdn)
+		switch rec.Type {
+		case "", "A", "AAAA":
+			ip, err := netip.ParseAddr(rec.Value)
+			if err != nil {
+				continue
+			}
+			if !slices.Contains(extraRecordNames, fqdn) {
+				extraRecordNames = append(extraRecordNames, fqdn)
+			}
+			dcfg.Hosts[fqdn] = append(dcfg.Hosts[fqdn], ip)
+		case "CNAME":
+			target, err := dnsname.ToFQDN(rec.Value)
+			if err != nil {
+				continue
+			}
+			if dcfg.HostCNAMEs == nil {
+				dcfg.HostCNAMEs = map[dnsname.FQDN]dnsname.FQDN{}
+			}
+			// Last write wins for duplicates; consistent with how Hosts
+			// would behave for duplicate IPs (which append) — CNAMEs
+			// don't append because a name can only have one canonical
+			// target per RFC 1034 §3.6.2.
+			dcfg.HostCNAMEs[fqdn] = target
+			if !slices.Contains(extraRecordNames, fqdn) {
+				extraRecordNames = append(extraRecordNames, fqdn)
+			}
+		default:
+			// Other record types remain unsupported; the wire spec at
+			// [tailcfg.DNSRecord] documents this.
+			continue
 		}
-		dcfg.Hosts[fqdn] = append(dcfg.Hosts[fqdn], ip)
 	}
 
 	if !prefs.CorpDNS() {

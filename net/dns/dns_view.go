@@ -129,6 +129,15 @@ func (v ConfigView) Hosts() views.MapSlice[dnsname.FQDN, netip.Addr] {
 	return views.MapSliceOf(v.ж.Hosts)
 }
 
+// HostCNAMEs maps a DNS FQDN to a single CNAME target FQDN.
+// Populated from [tailcfg.DNSConfig.ExtraRecords] entries with
+// Type=CNAME. The resolver chases CNAME chains in the local map
+// (cycle-safe, depth-limited) and emits the canonical-name records
+// in answers alongside the final A/AAAA.
+func (v ConfigView) HostCNAMEs() views.Map[dnsname.FQDN, dnsname.FQDN] {
+	return views.MapOf(v.ж.HostCNAMEs)
+}
+
 // SubdomainHosts is a set of FQDNs from Hosts that should also
 // resolve subdomain queries to the same IPs. For example, if
 // "node.tailnet.ts.net" is in SubdomainHosts, then queries for
@@ -158,6 +167,7 @@ var _ConfigViewNeedsRegeneration = Config(struct {
 	Routes                map[dnsname.FQDN][]*dnstype.Resolver
 	SearchDomains         []dnsname.FQDN
 	Hosts                 map[dnsname.FQDN][]netip.Addr
+	HostCNAMEs            map[dnsname.FQDN]dnsname.FQDN
 	SubdomainHosts        set.Set[dnsname.FQDN]
 	OnlyIPv6              bool
 	MagicDNSHostsUnrouted bool
